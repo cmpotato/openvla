@@ -497,6 +497,17 @@ class Prism_7B_DINOSigLIP_224px(Exp_7B_One_Stage):
     finetune_epochs: int = 2
 
 
+# === Custom :: DINOv3 + Qwen3VL Text ===
+@dataclass
+class Prism_DINOv3_Qwen3VLText_8B(Exp_7B_One_Stage):
+    model_id: str = "dinov3-qwen3vltext-align"
+    vision_backbone_id: str = "dinov3-vit-l"
+    llm_backbone_id: str = "qwen3vl-text-8b-instruct"
+    image_resize_strategy: str = "resize-naive"
+    llm_max_length: int = 32768
+    arch_specifier: str = "no-align+gelu-mlp"
+
+
 # === Define a Model Registry Enum for Reference & Validation ===
 @unique
 class ModelRegistry(Enum):
@@ -573,6 +584,9 @@ class ModelRegistry(Enum):
     OPT_DINOSIGLIP_224PX_RESIZE_NAIVE = Opt_7B_DINOSigLIP_ViT_SO_p14_224px_Resize_Naive
     PRISM_DINOSIGLIP_224PX_CONTROLLED_7B = Prism_7B_DINOSigLIP_224px_Controlled
     PRISM_DINOSIGLIP_224PX_7B = Prism_7B_DINOSigLIP_224px
+
+    # === Custom :: DINOv3 + Qwen3VL Text ===
+    PRISM_DINOV3_QWEN3VLTEXT_8B = Prism_DINOv3_Qwen3VLText_8B
 
     @property
     def model_id(self) -> str:
