@@ -79,6 +79,123 @@
 如果你的数据集不在默认路径，可通过以下参数覆盖：
 - `--dataset.dataset_root_dir /your/dataset/root`
 
+### 5.1 使用 VQA 数据生成 Align 所需 `chat.json`（执行计划）
+
+你当前在 `/home/max/openvla/data` 已准备 VQA 原始数据，目标是产出 `align` 阶段可直接读取的数据形态：
+- 一个 `chat.json`
+- 一个图片目录
+
+并满足 `AlignDataset` 约束：
+- 每条样本必须含 `image` 与 `conversations`
+- `conversations` 长度固定为 2（human + gpt）
+
+#### 5.1.1 输入数据（VQA）
+
+最少需要以下 3 类文件：
+
+1. 问题文件（questions）
+- `.../v2_OpenEnded_mscoco_train2014_questions.json`
+- `.../v2_OpenEnded_mscoco_val2014_questions.json`
+
+2. 标注文件（annotations）
+- `.../v2_mscoco_train2014_annotations.json`
+- `.../v2_mscoco_val2014_annotations.json`
+
+3. 图片目录
+- `train2014/` 与 `val2014/`（建议都准备）
+
+#### 5.1.2 映射规则（VQA -> align chat）
+
+对每个 `question_id` 进行 questions + annotations 关联，生成一条样本：
+
+1. `image`
+- 由 `image_id` 和 split 生成文件名：
+  - `train`: `COCO_train2014_{image_id:012d}.jpg`
+  - `val`: `COCO_val2014_{image_id:012d}.jpg`
+- `image` 字段写相对路径（相对后续图片根目录）。
+
+2. `conversations[0]`（human）
+- 固定模板（建议）：
+  - `"Answer the question based on the image.\\n<image>\\nQuestion: {question}"`
+
+3. `conversations[1]`（gpt）
+- 使用 `annotations.multiple_choice_answer` 作为监督答案。
+
+4. 过滤规则
+- 图片文件不存在：丢弃
+- `question` 为空或 `multiple_choice_answer` 为空：丢弃
+
+说明：VQA 是问答监督，不是图像描述。用它做 align 可跑通流程，但语义目标与 LLaVA caption 对齐任务不同，效果预期应单独评估。
+
+#### 5.1.3 输出目录（建议）
+
+为了复用当前 `llava-v15` 的 `align_stage_components` 结构，建议产出到：
+
+```text
+/home/max/openvla/data/vqa-align/
+  download/
+    llava-laion-cc-sbu-558k/
+      chat.json
+      train2014/...
+      val2014/...
+```
+
+其中：
+- `chat.json` 为转换结果
+- 图片可优先采用软链接（减少磁盘占用），不建议重复复制
+
+#### 5.1.4 实施步骤
+
+1. 新增转换脚本（建议路径）
+- `scripts/data/convert_vqa_to_align_chat.py`
+
+2. 脚本参数建议
+- `--questions-train`
+- `--questions-val`
+- `--annotations-train`
+- `--annotations-val`
+- `--images-train-dir`
+- `--images-val-dir`
+- `--output-chat-json`
+- `--output-image-root`
+- `--link-images`（是否软链接）
+
+3. 运行后生成 `chat.json` + 图片目录，并打印：
+- 样本总数
+- train/val 各自样本数
+- 过滤数（缺图、空文本等）
+
+#### 5.1.5 数据校验（必须）
+
+运行前后执行以下核验：
+
+1. JSON 可读且为 list：
+- `python -c "import json; x=json.load(open('chat.json')); print(type(x).__name__, len(x))"`
+
+2. 抽样检查字段：
+- 每条必须有 `image`、`conversations`
+- `len(conversations) == 2`
+
+3. 抽样检查图片路径可访问：
+- `os.path.exists(image_root / sample['image']) == True`
+
+#### 5.1.6 训练接入
+
+转换完成后，直接使用：
+
+```bash
+torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/pretrain.py \
+  --stage align \
+  --model.type dinov3-qwen3vltext-align \
+  --model.align_max_steps 20 \
+  --dataset.type llava-v15 \
+  --dataset.dataset_root_dir /home/max/openvla/data/vqa-align \
+  --run_root_dir /home/max/openvla/runs \
+  --trackers '["jsonl"]'
+```
+
+如果后续不想复用 `llava-v15` 目录约定，可在 `prismatic/conf/datasets.py` 新增一个 `vqa-align` 数据集配置项。
+
 ## 6. Align 需要调的超参数
 
 `align` 使用 `model.align_*` 字段：
@@ -99,18 +216,18 @@
 - `prismatic/conf/models.py:89`
 - `prismatic/conf/models.py:100`
 
-## 7. 冒烟测试（单卡、短跑）
+## 7. 冒烟测试（8卡、短跑）✅
 
-先跑最小化验证（在新 model config 注册完成后执行）：
+已验证成功的冒烟命令（20 step）：
 
 ```bash
-torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/pretrain.py \
+torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/pretrain.py \
   --stage align \
   --model.type dinov3-qwen3vltext-align \
+  --model.align_max_steps 20 \
   --dataset.type llava-v15 \
-  --dataset.dataset_root_dir /your/dataset/root \
-  --run_root_dir /home/max/openvla \
-  --max_steps 20 \
+  --dataset.dataset_root_dir /home/max/openvla/data/vqa-align \
+  --run_root_dir /home/max/openvla/runs \
   --trackers '["jsonl"]'
 ```
 
@@ -124,16 +241,17 @@ torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/pretrain.py \
 
 ## 8. 正式训练（多卡）
 
-冒烟测试通过后，按 GPU 数量扩展：
+冒烟测试通过后，保持同一套参数并拉长训练时长（示例：10000 step）：
 
 ```bash
 torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/pretrain.py \
   --stage align \
   --model.type dinov3-qwen3vltext-align \
+  --model.align_max_steps 10000 \
   --dataset.type llava-v15 \
-  --dataset.dataset_root_dir /your/dataset/root \
-  --run_root_dir /your/runs/root \
-  --trackers '["jsonl","wandb"]'
+  --dataset.dataset_root_dir /home/max/openvla/data/vqa-align \
+  --run_root_dir /home/max/openvla/runs \
+  --trackers '["jsonl"]'
 ```
 
 ## 9. 训练中监控项
@@ -141,6 +259,24 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/pretrain.py \
 1. 训练 loss 应下降且整体稳定。
 2. GPU 显存应处于可控范围。
 3. 日志应显示 projector 可训练，vision 与 LLM 冻结。
+
+## 10. 训练风险与注意事项（当前方案）
+
+1. VQA 在 `align` 阶段会丢弃问题文本
+- `AlignDataset` 只使用 `conversations[-1]` 作为监督目标，human 问题不会进入训练目标。
+- 对 VQA 数据来说，这更接近“看图直接生成短答案”，不是“图+问题 -> 答案”。
+- 参考：`prismatic/preprocessing/datasets/datasets.py:51`，`prismatic/preprocessing/datasets/datasets.py:72`。
+
+2. Qwen3VL tokenizer 无 BOS，与当前图像 token 插入假设存在偏差
+- 现有多模态拼接逻辑默认把图像 token 插入到首 token 后，并把首 token 的 label 置为 `IGNORE`。
+- Qwen3VL tokenizer 的 `bos_token_id` 为 `None`，会导致真实首文本 token 被忽略监督。
+- VQA 短答案比例高时，这会进一步削弱有效训练信号。
+- 参考：`prismatic/preprocessing/datasets/datasets.py:84`，`prismatic/models/vlms/prismatic.py:391`，`prismatic/models/vlms/prismatic.py:408`。
+
+3. 长跑 checkpoint 与恢复语义
+- 当前已改为每 100 step 保存一次 checkpoint（并保留 `max_steps` 到点保存）。
+- checkpoint 默认只保存可训练模块（`align` 阶段通常仅 projector），属于预期行为。
+- 若训练中断，请确认从正确的 `run_id/checkpoints/` 手动续跑路径恢复。
 
 参考：
 - `prismatic/models/vlms/prismatic.py:151`
@@ -155,12 +291,3 @@ align 阶段保存的模型状态应以可训练模块为主（重点是 project
 - `prismatic/training/strategies/ddp.py:40`
 - `prismatic/training/strategies/fsdp.py:101`
 - `prismatic/training/strategies/fsdp.py:110`
-
-## 11. 进入 Finetune 阶段
-
-align 结束后，使用 align checkpoint 进入 finetune 阶段。
-
-参考：
-- `scripts/pretrain.py:65`
-- `scripts/pretrain.py:67`
-- `scripts/pretrain.py:173`

@@ -15,28 +15,49 @@ import torch.nn.functional as F
 from torch import nn as nn
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import AutoConfig, AutoTokenizer
+from transformers import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLTextDecoderLayer,
+    Qwen3VLTextModel,
+)
 
 from prismatic.models.backbones.llm.base_llm import LLMBackbone
 from prismatic.models.backbones.llm.prompting import PromptBuilder, PurePromptBuilder
 from prismatic.overwatch import initialize_overwatch
 
-# Prefer MOE class names when available; fallback to dense class names in current transformers releases.
-try:
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLMoeForConditionalGeneration as Qwen3VLForConditionalGenerationCls,
-    )
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLMoeTextDecoderLayer as Qwen3VLDecoderLayerCls
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLMoeTextModel as Qwen3VLTextModelCls
-except ImportError:
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLForConditionalGeneration as Qwen3VLForConditionalGenerationCls,
-    )
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer as Qwen3VLDecoderLayerCls
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel as Qwen3VLTextModelCls
-
-
 overwatch = initialize_overwatch(__name__)
+
+
+def _patch_torch_autocast_api_for_transformers5() -> None:
+    """
+    Compatibility fix for the runtime error seen in training:
+    `TypeError: torch.is_autocast_enabled() takes no arguments (1 given)`.
+
+    Root cause:
+    - transformers>=5 (via `transformers.utils.generic.maybe_autocast`) calls
+      `torch.is_autocast_enabled(device_type=...)`.
+    - torch==2.2 only has no-arg `torch.is_autocast_enabled()`.
+    """
+    # If torch already supports the new signature, keep native behavior.
+    try:
+        torch.is_autocast_enabled("cuda")
+        return
+    except TypeError:
+        # torch 2.2 path: wrap old API with a signature-compatible shim.
+        pass
+
+    old_is_autocast_enabled = torch.is_autocast_enabled
+
+    def _compat_is_autocast_enabled(device_type: Optional[str] = None) -> bool:
+        del device_type
+        return old_is_autocast_enabled()
+
+    torch.is_autocast_enabled = _compat_is_autocast_enabled
+
+
+_patch_torch_autocast_api_for_transformers5()
 
 
 # Registry =>> Supported Qwen3-VL text-only backbones.
@@ -84,15 +105,12 @@ class Qwen3VLTextLLMBackbone(LLMBackbone):
                 f"Loading [bold]{self.llm_family}[/] text decoder from [underline]`{self.hf_hub_path}`[/]",
                 ctx_level=1,
             )
-            full_vlm = Qwen3VLForConditionalGenerationCls.from_pretrained(
+            full_vlm = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.hf_hub_path,
                 token=hf_token,
                 trust_remote_code=True,
                 local_files_only=local_files_only,
                 torch_dtype="auto",
-                do_sample=False,
-                temperature=1.0,
-                top_p=1.0,
             )
 
             # Keep only text decoder + lm_head as LLM backbone.
@@ -112,13 +130,17 @@ class Qwen3VLTextLLMBackbone(LLMBackbone):
                 local_files_only=local_files_only,
             )
             text_cfg = full_cfg.text_config
-            self.llm = Qwen3VLTextModelCls(text_cfg)
+            self.llm = Qwen3VLTextModel(text_cfg)
             self.lm_head = nn.Linear(text_cfg.hidden_size, text_cfg.vocab_size, bias=False)
 
         # Default training-time cache behavior.
         self.llm.config.use_cache = False if not self.inference_mode else True
         if not self.inference_mode:
             self.llm.enable_input_require_grads()
+
+        # PrismaticVLM expects `llm.generation_config` to exist.
+        if not hasattr(self.llm, "generation_config"):
+            self.llm.generation_config = GenerationConfig.from_model_config(self.llm.config)
 
         # Ensure PAD token is always set.
         if self.tokenizer.pad_token_id is None:
@@ -191,7 +213,7 @@ class Qwen3VLTextLLMBackbone(LLMBackbone):
 
     @property
     def transformer_layer_cls(self) -> Type[nn.Module]:
-        return Qwen3VLDecoderLayerCls
+        return Qwen3VLTextDecoderLayer
 
     @property
     def half_precision_dtype(self) -> torch.dtype:

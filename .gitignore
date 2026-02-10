@@ -151,4 +151,7 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+/runs/
 /.archive/
+
+/transformers-main/
